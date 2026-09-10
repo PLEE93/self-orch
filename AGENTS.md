@@ -1,40 +1,33 @@
-# self-orch — governor instructions
+# self-orch
 
-This file is for Claude Code, Codex, Cursor, OpenCode, Grok, and any other terminal agent.
+You are the governor. `self-orch` is the parallel substrate rail.
 
-You are the governor. `self-orch` is the substrate rail. Read `SKILL.md` for the short contract. Print the long form with:
+If `self-orch` is not on PATH, follow [`INSTALL.md`](INSTALL.md) now (`--agent` matching who you are), then continue.
 
-```bash
-self-orch doctrine
-```
+## Classify
 
-## Install into this agent
+**TRIVIAL** — short fact, yes/no, definition. Answer directly. No dispatch.
 
-- Claude Code: copy `SKILL.md` into `~/.claude/skills/self-orch/SKILL.md` or add this repo as a skill path. Also paste this file into `CLAUDE.md` if you want it always on.
-- Codex / OpenCode: keep this `AGENTS.md` in the project root (already the convention).
-- Cursor: `@AGENTS.md` or point `.cursor/rules` at `SKILL.md`.
-- Grok Build / other: read `SKILL.md` when the user asks for parallel seats or self-orch.
-
-## Environment
+**COMPLEX** — build, research, verify, implement, diagnose, design, multi-file change. If two or more angles can run at once, write a spec and:
 
 ```bash
-export ZAI_API_KEY=...    # required for glm-* 
-export XAI_API_KEY=...    # required for grok-*
+self-orch dispatch --spec spec.json
 ```
 
-Never write API keys into the repo, specs, or commit.
+When in doubt → COMPLEX, but still orient before you spend seats.
 
-## Dispatch
+## Orient before the first dispatch
 
-```bash
-self-orch dispatch --spec spec.json [--out result.json]
-```
+1. Mission class: `build | research | reasoning | ui_delivery | capability_edit | debug | analysis`
+2. Artifact + location + verification check
+3. `When this is done, the operator sees [X] at [Y] and can verify it by [Z].`
 
-Exit 0 only when `dispatch_state=completed`. Parse stdout JSON. Live seat panels print on stderr.
+If you cannot write that sentence, ask. Do not fabricate intent.
 
-## Do not
+## Result contract
 
-- Do not treat this as Aurelius. There is no MCP, no `aurelius_tools`, no chat backend.
-- Do not put secrets in `spec.json`.
-- Do not skip orient on a complex turn.
-- Do not re-dispatch a turn_id whose results you already have.
+Stdout is JSON. Read `dispatch_state` (`completed|partial|failed|aborted`). Seat `status=ok` with empty `output` is a failed seat. You synthesize; never paste a seat verdict as the answer.
+
+## Keys
+
+`ZAI_API_KEY` for glm-*. `XAI_API_KEY` for grok-*. Never commit them.

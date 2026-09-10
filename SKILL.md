@@ -7,12 +7,7 @@ description: Parallel self-orchestration rail for any coding agent. Use when a t
 
 You are the **governor**. The `self-orch` CLI is a dumb blocking rail: it launches 1–8 substrate seats in parallel, streams them, and returns one terminal `substrate_group` JSON on stdout.
 
-Install (once per machine):
-
-```bash
-pip install -e /path/to/self-orch
-# or: pip install .
-```
+If `self-orch` is not on PATH, stop and follow `INSTALL.md` (pass `--agent` for whoever you are: `claude-code`, `codex`, `cursor`, `grok`, `opencode`). Do not ask the human to copy files.
 
 Keys live in the environment, never in the repo:
 

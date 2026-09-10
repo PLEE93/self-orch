@@ -10,6 +10,8 @@ from pathlib import Path
 from . import __version__
 from .display import Dashboard
 from .doctrine import GOVERNOR_LOOP
+from .install import doctor as install_doctor
+from .install import main as install_main
 from .rail import SeatSpec, dispatch
 
 
@@ -101,6 +103,33 @@ def cmd_doctrine(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install(args: argparse.Namespace) -> int:
+    argv = ["--agent", args.agent, "--scope", args.scope]
+    if args.skip_cli:
+        argv.append("--skip-cli")
+    if args.dry_run:
+        argv.append("--dry-run")
+    if args.prefix:
+        argv.extend(["--prefix", args.prefix])
+    if args.project:
+        argv.extend(["--project", args.project])
+    return install_main(argv)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    payload = install_doctor(None if args.agent == "auto" else args.agent)
+    json.dump(payload, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    keys = payload.get("keys") or {}
+    if not any(keys.values()):
+        print("No model API keys in the environment. Ask the human for ZAI_API_KEY and/or XAI_API_KEY.", file=sys.stderr)
+        return 1
+    if not payload.get("cli"):
+        print("self-orch not on PATH. Run: python3 scripts/install.py --agent auto", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="self-orch",
@@ -124,6 +153,19 @@ def main(argv: list[str] | None = None) -> int:
 
     g = sub.add_parser("doctrine", help="print governor loop for injection into any agent")
     g.set_defaults(func=cmd_doctrine)
+
+    i = sub.add_parser("install", help="install CLI + wire skill into this coding agent")
+    i.add_argument("--agent", default="auto")
+    i.add_argument("--scope", default="user", choices=["user", "project"])
+    i.add_argument("--prefix", default="")
+    i.add_argument("--project", default=".")
+    i.add_argument("--skip-cli", action="store_true")
+    i.add_argument("--dry-run", action="store_true")
+    i.set_defaults(func=cmd_install)
+
+    doc = sub.add_parser("doctor", help="check CLI, keys, and skill wiring")
+    doc.add_argument("--agent", default="auto")
+    doc.set_defaults(func=cmd_doctor)
 
     args = p.parse_args(argv)
     return args.func(args)

@@ -1,11 +1,7 @@
 # Claude Code
 
-This project is a **self-orch** rail. You are the governor.
+You are the governor for **self-orch**.
 
-On complex tasks that benefit from parallel model seats, follow `SKILL.md` and `AGENTS.md`. Run `self-orch doctrine` if you need the full loop in-context.
+If `self-orch` is missing, follow `INSTALL.md` with `--agent claude-code`. That writes `~/.claude/skills/self-orch/SKILL.md` and a snippet into `~/.claude/CLAUDE.md`.
 
-```bash
-self-orch dispatch --spec spec.json
-```
-
-Keys: `ZAI_API_KEY` (glm-*), `XAI_API_KEY` (grok-*). Never commit them.
+Then, on complex parallel work, follow `SKILL.md` and run `self-orch dispatch --spec spec.json`.
