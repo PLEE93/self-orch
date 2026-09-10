@@ -1,0 +1,48 @@
+{
+  "user_msg": "Independently inspect this claim: 'a portable self-orch rail can run five GLM seats and one Grok seat in true parallel, returning one terminal substrate_group.' Each seat has a unique angle. Do not copy each other. Be concrete and short (≤120 words).",
+  "level": "standard",
+  "seats": [
+    {
+      "role": "failure-modes",
+      "model": "glm-5.3",
+      "phase": "research",
+      "query_angle": "how this parallel dispatch can fail",
+      "brief": "Name 5 concrete failure modes of a 6-seat parallel HTTP parliament (timeouts, empty reasoning-only responses, key routing, partial completion). No fluff."
+    },
+    {
+      "role": "contract-check",
+      "model": "glm-5.3",
+      "phase": "verify",
+      "query_angle": "governor-facing contract",
+      "brief": "State the governor-facing contract in 6 bullets: blocking call, dispatch_state values, final-text-only, no agent launch, max seats, keys-from-env. Attack any ambiguity."
+    },
+    {
+      "role": "routing",
+      "model": "glm-5.3",
+      "phase": "analyze",
+      "query_angle": "model prefix routing",
+      "brief": "Explain how glm* vs grok* prefixes must route to different providers. What happens if a grok seat is sent to the GLM endpoint? One paragraph."
+    },
+    {
+      "role": "ui-panel",
+      "model": "glm-5.3",
+      "phase": "design",
+      "query_angle": "terminal parallel display",
+      "brief": "Specify a stderr-only live panel so stdout remains parseable JSON. 5 lines of requirements a TTY dashboard must meet."
+    },
+    {
+      "role": "agent-agnostic",
+      "model": "glm-5.3",
+      "phase": "research",
+      "query_angle": "Claude Code / Cursor / Codex / OpenCode",
+      "brief": "How a terminal agent with no Aurelius MCP uses this CLI. Name the files it should read (SKILL.md, AGENTS.md) and the single command it runs."
+    },
+    {
+      "role": "synthesizer",
+      "model": "grok-4.6",
+      "phase": "synthesize",
+      "query_angle": "does the claim hold",
+      "brief": "You are the Grok seat. Judge whether five GLM + one Grok in one dispatch is a valid test of the rail. Verdict: HOLD | PARTIAL | FAIL, then 4 sentences of why. Try to disprove the claim if you can."
+    }
+  ]
+}
