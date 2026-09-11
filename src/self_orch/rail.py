@@ -486,6 +486,15 @@ def dispatch(
             for fut, idx in futs.items():
                 if results[idx] is None:
                     fut.cancel()
+                    # cancel() only un-queues a future that has not started. A seat
+                    # that is already running is a live Python thread and nothing
+                    # here can kill it -- so the dangerous part is not that it keeps
+                    # thinking, it is that it keeps WRITING, into a workspace the
+                    # next stage is about to read as if execution had finished.
+                    # Closing its toolbox is the part that can actually be enforced:
+                    # from here every tool call it makes is refused.
+                    if specs[idx].toolbox is not None:
+                        specs[idx].toolbox.cancelled = True
                     results[idx] = _error_seat(
                         specs[idx],
                         f"seat did not finish within the {deadline:.0f}s dispatch deadline "

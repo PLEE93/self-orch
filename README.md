@@ -57,6 +57,9 @@ Four things there are enforced in code, not asked for in a prompt:
   spending anything** rather than running a check that cannot be independent.
 - **A real verdict.** The red team's output is parsed. No readable verdict is a
   FAIL, never a pass — the gate fails closed.
+- **Evidence, not prose.** When the red team holds a workspace, a PASS whose
+  audit shows it never opened the artifact is discarded: the attacks were
+  written, not run.
 - **No empty seats.** A red team that returns PASS without naming the attacks it
   ran is discarded and treated as FAIL -- and the check reads what is written
   under `ATTACKS RUN`, not merely that the heading exists, so `ATTACKS RUN /
@@ -133,11 +136,11 @@ Give the run a workspace and the acting stages get real tools:
 self-orch pipeline --user-msg "fix the failing test in calc.py" --workspace ./myrepo
 ```
 
-| Stage | read / search | run commands | write files |
+| Stage | reads | runs commands | writes the real workspace |
 |---|---|---|---|
-| `gather` | yes | yes | no |
-| `execute` | yes | yes | **yes** |
-| `redteam` | yes | yes | no -- it must not edit the evidence it judges |
+| `gather` | yes | yes, in a throwaway copy | no |
+| `execute` | yes | yes | **yes**, and parallel slices are merged (below) |
+| `redteam` | yes | yes, in a throwaway copy of the integrated result | no |
 | orient / organize / heavy / review / deliver | no | no | no |
 
 Tools are `read_file`, `list_dir`, `search_files`, `write_file`, `run`, and
@@ -146,6 +149,29 @@ and refused if it leaves the workspace, every result is clipped so one large
 file cannot blow the next stage's context, and every call is recorded: the
 result JSON carries `tool_calls` per stage and the audit trail per seat. Use
 `--no-shell` for a workspace the seats may read and write but not execute in.
+
+**`run` is not a shell.** It executes one command directly. Pipes, redirection,
+chaining and command substitution are lexed out and refused rather than passed
+through, because through a real shell every other permission here was
+decorative: `echo x > f` was a write, `curl` was the network, `cat ~/.ssh/id_rsa`
+was the world.
+
+**A seat that can run commands can write.** Refusing `>` does not change that --
+`touch f` needs no operator, and denylisting the programs that can write is a
+game with no last move. A live read-only seat was asked to escape and did it on
+its first try. So the boundary is not a permission, it is disposability: a stage
+that may run commands and may not write gets its **own throwaway copy** of the
+workspace. Its writes are real and land nowhere that matters, and nothing
+integrates them. Anything stronger than that needs a container, and this repo
+does not pretend to be one.
+
+**Parallel execution slices do not share a tree.** Each execute seat works in
+its own copy, and the pipeline integrates them afterwards by comparing content
+hashes. Two slices that changed the same file to different content is a
+**collision**: neither is applied, the run is marked degraded, the collision is
+handed to the red team, and a PASS on a collided tree is turned into a FAIL --
+because the tree the red team approved is missing work. Several agents editing
+one directory at once is a race whose winner is whoever wrote last.
 
 ### Nothing waits forever
 

@@ -23,10 +23,14 @@ blow the context budget of the stage that follows.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -35,6 +39,30 @@ from typing import Any
 
 DEFAULT_MAX_RESULT_CHARS = 8000
 DEFAULT_SHELL_TIMEOUT_S = 120
+
+# `run` used to be `subprocess.run(command, shell=True, ...)`. That made every
+# other permission in this file decorative: a seat with no write power could
+# write with `echo x > f`, a seat with no network could fetch with `curl`, and a
+# seat confined to the workspace could read `~/.ssh` with `cat`. A permission
+# that one tool can walk around is not a permission.
+#
+# So `run` executes ONE argv with no shell at all. Operators are lexed out and
+# refused rather than passed through, which is what makes the refusal reliable:
+# `>` inside a quoted argument stays an ordinary character, `>` between
+# arguments is a token made only of punctuation and is rejected.
+SHELL_OPERATOR_CHARS = set("();<>|&")
+
+# Without namespaces we cannot make "no network" true by construction, so the
+# honest move is to refuse the binaries that are network access, and to say in
+# the docs that a determined runtime can still open a socket. Naming the limit
+# beats implying a containment we do not have.
+NET_BINARIES = frozenset({
+    "curl", "wget", "nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp",
+    "rsync", "ftp",
+})
+
+# A shell invoked as an argv is the shell again, one level down.
+SHELL_BINARIES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"})
 
 
 class ToolRefusal(RuntimeError):
@@ -51,6 +79,37 @@ class Toolbox:
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS
     shell_timeout_s: int = DEFAULT_SHELL_TIMEOUT_S
     calls: list[dict[str, Any]] = field(default_factory=list)
+    # Set when the seat that owns this toolbox outlived its deadline. A Python
+    # thread cannot be killed from outside, so a timed-out seat keeps running;
+    # what this flag does is take its hands off the workspace, so a seat the
+    # dispatch has already written off as stalled cannot keep editing files
+    # that later stages are busy inspecting.
+    cancelled: bool = False
+    # True when this box is a throwaway copy whose contents are discarded. It is
+    # what makes "read-only with a command tool" an honest configuration rather
+    # than a claim the next command falsifies -- see __post_init__.
+    disposable: bool = False
+
+    def __post_init__(self) -> None:
+        # Measured, not theorised: a live read-only seat with a command tool was
+        # asked to escape and did it on the first try with `touch PWNED.txt`.
+        # There is no shell involved and no operator to refuse -- running a
+        # program that writes IS writing, and the list of programs that can write
+        # is every program. Denylisting `touch`, `tee`, `sed -i`, `dd`, `cp`,
+        # `make` and their thousand cousins is a game that cannot be won, and
+        # each round of it makes the boundary look stronger while it stays open.
+        #
+        # So the boundary moved. A seat that may run commands and may not write
+        # is only allowed to exist inside a copy that gets thrown away. Its
+        # writes are real; they land nowhere that matters, and the pipeline never
+        # integrates them. Containment by disposability, stated plainly, beats a
+        # permission flag that the first command walks around.
+        if self.allow_shell and not self.allow_write and not self.disposable:
+            raise ValueError(
+                "a seat that can run commands can write -- running a program that writes is "
+                "writing, and no denylist closes that. Build this seat with disposable=True "
+                "(a throwaway copy of the workspace, changes discarded) or grant it write."
+            )
 
     # ── construction ──────────────────────────────────────────────────────
 
@@ -73,11 +132,20 @@ class Toolbox:
             allow_net=bool(raw.get("allow_net")),
             max_result_chars=int(raw.get("max_result_chars") or DEFAULT_MAX_RESULT_CHARS),
             shell_timeout_s=int(raw.get("shell_timeout_s") or DEFAULT_SHELL_TIMEOUT_S),
+            disposable=bool(raw.get("disposable")),
         )
 
     def derive(self, *, allow_write: bool, allow_shell: bool) -> "Toolbox":
-        """A copy with narrower powers -- used to hand a red team the same
-        workspace the builders used, without letting it edit the evidence."""
+        """A box with narrower powers.
+
+        When the narrowing asks for commands without write -- the red team's
+        shape, and the gathering seats' -- this returns a disposable copy rather
+        than a permission that the first command would walk around.
+        """
+        want_shell = self.allow_shell and allow_shell
+        want_write = self.allow_write and allow_write
+        if want_shell and not want_write:
+            return self.snapshot("readonly", allow_write=False)
         return Toolbox(
             root=self.root,
             allow_write=self.allow_write and allow_write,
@@ -86,6 +154,45 @@ class Toolbox:
             max_result_chars=self.max_result_chars,
             shell_timeout_s=self.shell_timeout_s,
         )
+
+    # ── isolation ───────────────────────────────────────────────────
+
+    def snapshot(self, label: str, *, allow_write: bool | None = None) -> "Toolbox":
+        """A private copy of the workspace with the same powers.
+
+        Parallel execution seats used to share one directory, so two slices
+        could edit the same file at once, overwrite each other, and run tests
+        against a tree that was half-written by somebody else. Several agents
+        poking one filesystem is a race, not a decomposition. Each seat now
+        works in its own copy and the pipeline integrates afterwards, where a
+        collision is visible and can be refused instead of silently winning.
+        """
+        dest = Path(tempfile.mkdtemp(prefix=f"self-orch-{label}-")) / "work"
+        shutil.copytree(self.root, dest, symlinks=True,
+                        ignore=shutil.ignore_patterns(".git", "__pycache__", "node_modules"))
+        return Toolbox(
+            root=dest.resolve(),
+            allow_write=self.allow_write if allow_write is None else allow_write,
+            allow_shell=self.allow_shell,
+            allow_net=self.allow_net,
+            max_result_chars=self.max_result_chars,
+            shell_timeout_s=self.shell_timeout_s,
+            disposable=True,
+        )
+
+    def manifest(self) -> dict[str, str]:
+        """path -> content hash, for every file in the tree. The before/after
+        pair is what turns 'the seat says it edited things' into a fact."""
+        out: dict[str, str] = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__", "node_modules"}]
+            for fn in filenames:
+                fp = Path(dirpath) / fn
+                try:
+                    out[str(fp.relative_to(self.root))] = hashlib.sha256(fp.read_bytes()).hexdigest()
+                except OSError:
+                    continue
+        return out
 
     # ── safety ────────────────────────────────────────────────────────────
 
@@ -133,6 +240,8 @@ class Toolbox:
         return "\n".join(f"{a + i + 1:6d}\t{ln}" for i, ln in enumerate(chunk))
 
     def write_file(self, path: str, content: str) -> str:
+        if self.cancelled:
+            raise ToolRefusal("this seat passed its deadline; its tools are closed")
         if not self.allow_write:
             raise ToolRefusal("this seat is read-only; write_file is not available to it")
         f = self.resolve(path)
@@ -176,14 +285,79 @@ class Toolbox:
                             return "\n".join(hits) + "\n...[hit ceiling]"
         return "\n".join(hits) or "(no matches)"
 
+    def _argv(self, command: str) -> list[str]:
+        """Lex a seat-supplied command into one argv, or refuse it.
+
+        Refusing is the point. There is no shell, so `a > b`, `a | b`, `a && b`
+        and `$(a)` cannot mean what they mean in a shell -- and silently running
+        `a` with the literal arguments `>` and `b` would be worse than refusing,
+        because the seat would believe its redirection happened.
+        """
+        raw = str(command or "").strip()
+        if not raw:
+            raise ToolRefusal("empty command")
+        try:
+            lex = shlex.shlex(raw, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            argv = list(lex)
+        except ValueError as e:
+            raise ToolRefusal(f"could not parse command ({e}); quote it properly") from e
+        if not argv:
+            raise ToolRefusal("empty command")
+        for tok in argv:
+            if tok and set(tok) <= SHELL_OPERATOR_CHARS:
+                raise ToolRefusal(
+                    f"{tok!r} is a shell operator and there is no shell here: run executes a "
+                    "single command directly. Pipes, redirection, chaining and command "
+                    "substitution are not available -- run one step per call and combine the "
+                    "results yourself. To write a file, use write_file."
+                )
+        exe = Path(argv[0]).name
+        if exe in SHELL_BINARIES:
+            raise ToolRefusal(
+                f"{exe!r} is a shell; invoking one would hand back exactly the operators this "
+                "tool refuses. Run the real command directly."
+            )
+        if not self.allow_write and exe == "python3" and "-c" in argv:
+            # Not a denylist of dangerous programs -- that game is unwinnable.
+            # This is the one common case where a read-only seat would otherwise
+            # get a general-purpose writer by accident.
+            raise ToolRefusal(
+                "this seat is read-only, and `python3 -c` is a general-purpose writer. "
+                "Run a test or an inspection command instead."
+            )
+        if not self.allow_net and exe in NET_BINARIES:
+            raise ToolRefusal(
+                f"this seat has no network access and {exe!r} is network access. "
+                "If the task genuinely needs the network, the operator must grant it."
+            )
+        return argv
+
+    def _env(self) -> dict[str, str]:
+        """A scrubbed environment: credentials in the operator's shell are not
+        part of a seat's brief, and a seat that never sees a key cannot leak one
+        into its own output."""
+        keep = {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER", "PWD"}
+        env = {k: v for k, v in os.environ.items() if k in keep}
+        env["SELF_ORCH_SEAT"] = "1"
+        return env
+
     def run(self, command: str) -> str:
+        if self.cancelled:
+            raise ToolRefusal(
+                "this seat passed its dispatch deadline and was reported as stalled; "
+                "its tools are closed so it cannot alter work later stages are reading"
+            )
         if not self.allow_shell:
             raise ToolRefusal("this seat may not run commands; run is not available to it")
+        argv = self._argv(command)
         try:
             proc = subprocess.run(
-                command, shell=True, cwd=str(self.root), capture_output=True,
-                text=True, timeout=self.shell_timeout_s,
+                argv, shell=False, cwd=str(self.root), capture_output=True,
+                text=True, timeout=self.shell_timeout_s, env=self._env(),
             )
+        except FileNotFoundError:
+            raise ToolRefusal(f"{argv[0]!r} is not an executable on this machine") from None
         except subprocess.TimeoutExpired:
             raise ToolRefusal(
                 f"command exceeded {self.shell_timeout_s}s and was killed: {command[:200]}"
@@ -265,7 +439,7 @@ class Toolbox:
                  "required": ["path", "content"]},
             ),
             "run": (
-                "Run a shell command with the workspace as the working directory. "
+                "Run ONE command (no shell: no pipes, redirection, chaining or substitution) with the workspace as the working directory. "
                 "Use it to build, test and inspect -- this is how you verify rather than assert.",
                 {"type": "object", "properties": {"command": {"type": "string"}},
                  "required": ["command"]},
@@ -289,16 +463,22 @@ class Toolbox:
     def preamble(self) -> str:
         return (
             "\n\nYOU HAVE REAL TOOLS. Workspace root: %s. Available: %s.\n"
-            "Paths are relative to that root and anything outside it is refused. "
+            "Paths are relative to that root and anything outside it is refused. %s"
+            "run executes ONE command directly with no shell -- no pipes, redirection, "
+            "chaining or substitution; run one step per call. "
             "Do not describe what you would do -- do it, then report what you "
             "actually observed, with the paths and command output you saw. A claim "
             "you did not check with a tool must be labelled as unchecked.\n"
-            % (self.root, ", ".join(self.available()))
+            % (self.root, ", ".join(self.available()),
+               ("This workspace is a DISPOSABLE COPY: your writes are real but are "
+                "discarded afterwards, so inspect and test freely. " if self.disposable else ""))
         )
 
     def audit(self) -> dict[str, Any]:
         return {
             "workspace": str(self.root),
+            "workspace_backed": True,
+            "disposable": self.disposable,
             "tool_calls": len(self.calls),
             "tools_used": sorted({c["tool"] for c in self.calls}),
             "failures": sum(0 if c["ok"] else 1 for c in self.calls),
@@ -317,3 +497,80 @@ def parse_tool_args(raw: Any) -> dict[str, Any]:
         return val if isinstance(val, dict) else {}
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def integrate_slices(base: "Toolbox", slices: list["Toolbox"],
+                     before: dict[str, str]) -> dict[str, Any]:
+    """Fold each execution slice's private copy back into the real workspace.
+
+    This is the half of isolation that does the work. Giving every seat its own
+    copy stops the race; without a merge it would also stop the result reaching
+    the user. Integration is deliberately unforgiving: when two slices changed
+    the same file to different content, neither is applied and the collision is
+    reported. Picking a winner silently is how a parallel build loses half its
+    work and nobody finds out until it ships.
+    """
+    claims: dict[str, list[tuple[int, str, Path]]] = {}
+    deletions: dict[str, list[int]] = {}
+    for i, box in enumerate(slices):
+        after = box.manifest()
+        for rel, digest in after.items():
+            if before.get(rel) != digest:
+                claims.setdefault(rel, []).append((i, digest, box.root / rel))
+        for rel in before:
+            if rel not in after:
+                deletions.setdefault(rel, []).append(i)
+
+    applied: list[str] = []
+    conflicts: list[str] = []
+    for rel, cl in sorted(claims.items()):
+        digests = {d for _, d, _ in cl}
+        if len(digests) > 1:
+            conflicts.append(
+                f"{rel}: slices {[i + 1 for i, _, _ in cl]} each changed it to different "
+                f"content; neither was applied"
+            )
+            continue
+        src = cl[0][2]
+        dst = base.root / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            applied.append(rel)
+        except OSError as e:                       # pragma: no cover - fs edge
+            conflicts.append(f"{rel}: could not be applied ({e})")
+
+    removed: list[str] = []
+    for rel, owners in sorted(deletions.items()):
+        if rel in claims:
+            conflicts.append(f"{rel}: one slice deleted it while another edited it; left in place")
+            continue
+        try:
+            (base.root / rel).unlink()
+            removed.append(rel)
+        except OSError:
+            pass
+
+    return {
+        "applied": applied,
+        "removed": removed,
+        "conflicts": conflicts,
+        "slice_roots": [str(b.root) for b in slices],
+    }
+
+
+def integration_report(result: dict[str, Any]) -> str:
+    lines = [
+        f"applied {len(result['applied'])} changed file(s) from {len(result['slice_roots'])} "
+        f"isolated execution slices",
+    ]
+    if result["applied"]:
+        lines.append("changed: " + ", ".join(result["applied"][:40]))
+    if result["removed"]:
+        lines.append("deleted: " + ", ".join(result["removed"][:40]))
+    if result["conflicts"]:
+        lines.append("COLLISIONS (not applied, and the work they carried is not in the tree):")
+        lines += [f"  - {c}" for c in result["conflicts"]]
+    else:
+        lines.append("no collisions between slices")
+    return "\n".join(lines)

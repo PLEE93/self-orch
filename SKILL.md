@@ -98,8 +98,8 @@ vendor resolved.
 ## Giving seats real tools
 
 Seats are text-only unless you give the run a workspace. With one, `gather`,
-`execute` and `redteam` can read, search and run commands inside it, and
-`execute` can also write:
+`execute` and `redteam` can read, search and run commands, and `execute` can
+also write:
 
 ```bash
 self-orch pipeline --user-msg "..." --workspace /path/to/repo
@@ -117,6 +117,20 @@ Paths that leave the workspace are refused, results are clipped, and every call
 is audited into the result JSON (`tool_calls`, `tools_used`). Tell a tool-having
 seat to **do the work and report what it observed**, not to describe what it
 would do -- and treat any claim it did not check with a tool as unchecked.
+
+Three things about that workspace are worth knowing before you brief a seat:
+
+- `run` executes ONE command with no shell. No pipes, redirection, chaining or
+  substitution -- run one step per call. To write a file, use `write_file`.
+- A seat that runs commands can write, whatever its flags say, so `gather` and
+  `redteam` are given a **disposable copy** instead: their writes are real and
+  are discarded. `redteam`'s copy is taken after the execution slices have been
+  integrated, so it judges the tree that actually exists and cannot alter it.
+- Parallel `execute` seats each get their own copy and are merged afterwards.
+  Two slices changing the same file to different content collides: neither lands,
+  and a red-team PASS over a collided tree is downgraded to FAIL.
+- A workspace-holding red team that returns PASS without a single tool call is
+  discarded -- named attacks with no audit behind them are a story about testing.
 
 Deadlines: `SELF_ORCH_SEAT_TIMEOUT_S` (default 600) bounds each socket read and
 `SELF_ORCH_DISPATCH_TIMEOUT_S` (default 1800) bounds the whole round. A stalled

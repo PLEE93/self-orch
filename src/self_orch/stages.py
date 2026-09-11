@@ -35,7 +35,7 @@ from typing import Any, Callable
 from .context_budget import compose_within
 from .providers import model_family
 from .rail import MAX_USER_MSG_CHARS, SeatSpec, dispatch
-from .seat_tools import Toolbox
+from .seat_tools import Toolbox, integrate_slices, integration_report
 from .stage_prompts import STAGE_BRIEFS
 from .tiers import resolve_tier
 
@@ -111,6 +111,10 @@ class StageRun:
     anomalies: list[str] = field(default_factory=list)
     tool_calls: int = 0
     tools_used: list[str] = field(default_factory=list)
+    # True when this stage's seats actually held a workspace. The red-team gate
+    # reads it to decide whether 'you named attacks' is enough or whether the
+    # audit must show the attacks were run.
+    tools_backed: bool = False
 
     @property
     def text(self) -> str:
@@ -123,6 +127,7 @@ class StageRun:
             "elapsed_s": round(self.elapsed_s, 3), "status": self.status,
             "verdict": self.verdict, "anomalies": self.anomalies,
             "tool_calls": self.tool_calls, "tools_used": self.tools_used,
+            "tools_backed": self.tools_backed,
             "output_chars": len(self.text),
         }
 
@@ -213,16 +218,24 @@ def named_attacks(text: str) -> list[str]:
     return attacks
 
 
-def evaluate_redteam(text: str) -> tuple[bool, str]:
+def evaluate_redteam(text: str, audit: dict[str, Any] | None = None) -> tuple[bool, str]:
     """(passed, reason). The red-team gate, failing closed on every ambiguity.
 
-    Four ways to not pass, and only one way to pass:
+    Five ways to not pass, and only one way to pass:
       - no parseable verdict            -> FAIL (a gate that cannot read its own
                                            result must never report success)
       - verdict FAIL                    -> FAIL (the ordinary case)
       - PASS with no ATTACKS RUN block  -> FAIL (an empty seat)
       - PASS with the block present but
         nothing named under it          -> FAIL (the same empty seat, dressed)
+      - PASS naming attacks, from a seat
+        that had tools and never used
+        them                            -> FAIL (the attacks were written, not run)
+
+    That last one is the difference between reading a claim and checking it. When
+    the red team holds a workspace it can open the artifact and execute checks, so
+    a prose list of attacks is verifiable against what it actually did. A verdict
+    whose named attacks left no trace in the tool audit is a story about testing.
     """
     body = text or ""
     verdict = parse_verdict(body)
@@ -236,6 +249,15 @@ def evaluate_redteam(text: str) -> tuple[bool, str]:
     if not attacks:
         return False, ("red team returned PASS with an ATTACKS RUN heading but nothing "
                        "named under it (empty seat, discarded)")
+    if audit and audit.get("workspace_backed"):
+        used = set(audit.get("tools_used") or [])
+        inspected = used & {"run", "read_file", "search_files", "list_dir"}
+        if int(audit.get("tool_calls") or 0) < 1 or not inspected:
+            return False, (
+                f"red team returned PASS naming {len(attacks)} attack(s) but made no tool "
+                "call against the workspace it was given -- the attacks were written, not "
+                "run. Discarded."
+            )
     return True, f"red team PASS with {len(attacks)} named attack(s)"
 
 
@@ -278,23 +300,47 @@ def assert_family_split(adversary_model: str, subject_model: str, what: str) -> 
         )
 
 
-def assert_stage_order(stages_run: list[str]) -> None:
-    """Refuse a ledger whose stages did not follow the declared order.
+# The pipeline's legal transitions, written out. The previous validator compared
+# stage indices and exempted execute/redteam from moving backwards, which let a
+# ledger like orient..review, redteam, execute, deliver pass -- red team running
+# before the thing it is supposed to attack. An order invariant that accepts the
+# one ordering it exists to forbid is worse than none, because it is quoted as
+# proof. A transition table cannot drift from the order it describes.
+STAGE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "orient":   frozenset({"gather"}),
+    "gather":   frozenset({"organize"}),
+    "organize": frozenset({"heavy"}),
+    "heavy":    frozenset({"review"}),
+    "review":   frozenset({"execute"}),
+    "execute":  frozenset({"redteam"}),
+    "redteam":  frozenset({"execute", "deliver"}),
+    "deliver":  frozenset(),
+}
 
-    Repeats are legal (the execute/redteam loop), skips and reorderings are not.
+
+def assert_stage_order(stages_run: list[str]) -> None:
+    """Refuse a ledger that is not a walk through STAGE_TRANSITIONS.
+
+    Three ways to fail: an unknown stage, a start that is not orient, or a step
+    the table does not allow. Mandatory presence is checked too, because a walk
+    that stops early is legal as a walk and still is not a run of this pipeline.
     """
-    seen = [s for s in stages_run]
-    pos = -1
+    seen = list(stages_run)
+    if not seen:
+        raise PipelineRefusal("empty ledger: no stage ran")
     for name in seen:
         if name not in STAGE_ORDER:
             raise PipelineRefusal(f"unknown stage {name!r} in ledger")
-        idx = STAGE_ORDER.index(name)
-        if idx < pos and name not in ("execute", "redteam"):
+    if seen[0] != "orient":
+        raise PipelineRefusal(
+            f"ledger starts at {seen[0]!r}; every run starts at orient. Ledger: {seen}"
+        )
+    for a, b in zip(seen, seen[1:]):
+        if b not in STAGE_TRANSITIONS[a]:
             raise PipelineRefusal(
-                f"stage {name!r} ran after a later stage; only execute/redteam "
-                f"may repeat (loop-back). Ledger: {seen}"
+                f"illegal transition {a!r} -> {b!r}; the only steps allowed after {a!r} are "
+                f"{sorted(STAGE_TRANSITIONS[a]) or 'none (it is terminal)'}. Ledger: {seen}"
             )
-        pos = max(pos, idx)
     missing = [name for name in STAGE_ORDER if name in MANDATORY_STAGES and name not in seen]
     if missing:
         raise PipelineRefusal(
@@ -375,6 +421,11 @@ def run_pipeline(
         if not base_box or stage not in STAGE_TOOL_POWERS:
             return None
         write, shell = STAGE_TOOL_POWERS[stage]
+        # derive() hands the read-only-with-commands stages (gather, redteam) a
+        # disposable copy instead of a permission their first command would walk
+        # around. For redteam the copy is taken here, at call time, which is
+        # after the execution slices have been integrated -- so it judges the
+        # tree that actually exists, and cannot alter it.
         return base_box.derive(allow_write=write, allow_shell=shell)
 
     def model_for(stage: str) -> tuple[str, str]:
@@ -382,7 +433,8 @@ def run_pipeline(
         return tier, resolve_tier(tier)
 
     def run_stage(stage: str, context: str, seats: int = 1,
-                  angles: list[str] | None = None, loop: int = 0) -> StageRun:
+                  angles: list[str] | None = None, loop: int = 0,
+                  boxes: list[Toolbox] | None = None) -> StageRun:
         tier, model = model_for(stage)
         brief = STAGE_BRIEFS[stage]
         specs = []
@@ -392,7 +444,7 @@ def run_pipeline(
             specs.append(SeatSpec(
                 role=role, model=model, phase=stage, query_angle=angle,
                 brief=brief + (f"\n\nYOUR ANGLE: {angle}\n" if angle else ""),
-                toolbox=toolbox_for(stage),
+                toolbox=(boxes[i] if boxes and i < len(boxes) else toolbox_for(stage)),
             ))
         r = dispatch_fn(specs, user_msg=context, level=level)
         data = r.to_dict() if hasattr(r, "to_dict") else r
@@ -406,6 +458,7 @@ def run_pipeline(
             outputs=outs, anomalies=list(data.get("anomalies") or []),
             tool_calls=sum(int(a.get("tool_calls") or 0) for a in audits),
             tools_used=sorted({t for a in audits for t in (a.get("tools_used") or [])}),
+            tools_backed=any(a.get("workspace_backed") for a in audits),
         )
         ledger.append(run)
         if on_stage:
@@ -474,24 +527,49 @@ def run_pipeline(
 
     # 6/7. execute -> redteam, looping on FAIL
     required_changes = ""
+    integration = ""
     while True:
+        # Each parallel slice works in its own copy of the workspace. Sharing one
+        # directory across concurrent seats meant two slices could edit the same
+        # file at the same time and run their tests against each other's
+        # half-written state; the winner was whoever wrote last. With one seat
+        # there is no race, so it works in the real tree directly.
+        exec_boxes: list[Toolbox] | None = None
+        before: dict[str, str] = {}
+        if base_box and execute_seats > 1:
+            before = base_box.manifest()
+            exec_boxes = [toolbox_for("execute").snapshot(f"exec{loops_done}-{i + 1}")
+                          for i in range(execute_seats)]
+
         execute = run_stage("execute", _compose([
             ("original request", user_msg, 5),
             ("working brief", orient.text, 4),
             ("approved plan", heavy.text, 3),
             ("review findings to honour", review.text),
             ("required changes from the previous red-team pass", required_changes),
-        ]), seats=execute_seats, angles=slices, loop=loops_done)
+        ]), seats=execute_seats, angles=slices, loop=loops_done, boxes=exec_boxes)
+
+        if exec_boxes and base_box:
+            merged = integrate_slices(base_box, exec_boxes, before)
+            integration = integration_report(merged)
+            if merged["conflicts"]:
+                execute.status = "degraded"
+                execute.anomalies.extend(merged["conflicts"])
 
         redteam = run_stage("redteam", _compose([
             ("original request", user_msg, 5),
             ("working brief and its test criteria", orient.text, 4),
             ("the plan", heavy.text),
             ("what execution produced", execute.text, 3),
+            ("how the parallel slices were integrated", integration),
         ]), loop=loops_done)
 
-        passed, reason = evaluate_redteam(redteam.text)
+        passed, reason = evaluate_redteam(redteam.text, redteam.to_dict())
         redteam.verdict = "PASS" if passed else "FAIL"
+        if passed and integration and "COLLISIONS" in integration:
+            passed, reason = False, ("slices collided during integration, so the tree the red "
+                                     "team passed is missing work: " + integration)
+            redteam.verdict = "FAIL"
         if passed:
             break
         if loops_done >= max_loops:

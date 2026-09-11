@@ -317,7 +317,9 @@ def test_a_skipped_stage_is_refused():
     for backward transitions, so dropping gather and organize passed."""
     with pytest.raises(PipelineRefusal) as e:
         assert_stage_order(["orient", "heavy", "review", "execute", "redteam", "deliver"])
-    assert "missing mandatory stage" in str(e.value)
+    # The transition table catches this one step earlier and for a stricter
+    # reason than the old presence check: orient cannot step to heavy at all.
+    assert "illegal transition" in str(e.value) or "missing mandatory stage" in str(e.value)
 
 
 def test_a_full_ledger_with_loops_is_accepted():
