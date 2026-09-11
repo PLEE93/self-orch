@@ -192,6 +192,8 @@ Work through, in order:
 
 Return:
 VERDICT: one of APPROVE / APPROVE-WITH-CHANGES / REJECT -- on its own line.
+  This line is parsed. If it is missing or unreadable the run stops before
+  execution: an unreadable review is not an approval.
 ATTACKS RUN -- what you tried, and what happened. A review that approves without
   naming attempted falsifications is treated as an empty seat and will be
   discarded.
@@ -270,6 +272,9 @@ Attack in this order:
 
 Return, in this exact shape:
 VERDICT: PASS or FAIL -- on its own line, nothing else on that line.
+  Both lines below are parsed. A PASS whose ATTACKS RUN section is empty, or
+  says "none", is discarded and read as FAIL -- name each attack on its own
+  line, one per attempt, with what happened.
 ATTACKS RUN -- what you attempted and what happened. A verdict with no named
   attacks is an empty seat and will be discarded regardless of what it says.
 CRITERION RESULTS -- each criterion with PASS, FAIL, or UNTESTED, and why.

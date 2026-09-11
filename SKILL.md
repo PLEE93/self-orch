@@ -95,6 +95,34 @@ Prefer tiers over literal ids when you do not know which models this user has.
 Run `self-orch doctor` to see the current tier table and which credential each
 vendor resolved.
 
+## Giving seats real tools
+
+Seats are text-only unless you give the run a workspace. With one, `gather`,
+`execute` and `redteam` can read, search and run commands inside it, and
+`execute` can also write:
+
+```bash
+self-orch pipeline --user-msg "..." --workspace /path/to/repo
+```
+
+For an ad-hoc fanout, `self-orch dispatch --workspace /path/to/repo` gives every
+seat the same tools, or put a `tools` block on an individual seat in the spec:
+
+```json
+{"role": "implementer", "model": "tier1", "brief": "...",
+ "tools": {"workspace": "/path/to/repo", "allow_write": true, "allow_shell": true}}
+```
+
+Paths that leave the workspace are refused, results are clipped, and every call
+is audited into the result JSON (`tool_calls`, `tools_used`). Tell a tool-having
+seat to **do the work and report what it observed**, not to describe what it
+would do -- and treat any claim it did not check with a tool as unchecked.
+
+Deadlines: `SELF_ORCH_SEAT_TIMEOUT_S` (default 600) bounds each socket read and
+`SELF_ORCH_DISPATCH_TIMEOUT_S` (default 1800) bounds the whole round. A stalled
+seat comes back as an error inside a `partial` group -- read them, do not assume
+`partial` means the work failed.
+
 ## Rules
 
 - Zero chatter before the dispatch. The tool call is the first emit.

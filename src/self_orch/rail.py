@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .doctrine import is_verification_role, maybe_append_falsification, mission_block
+from .seat_tools import Toolbox, parse_tool_args
 from .providers import ProviderError, auth_headers, chat_url, model_family, resolve_provider
 
 MAX_SEATS = 8
@@ -18,6 +21,14 @@ MAX_BRIEF_CHARS = 8000
 MAX_USER_MSG_CHARS = 12000
 SCHEMA = "self_orch.substrate_group.v3"
 ANTHROPIC_MAX_TOKENS = 8192
+
+# A provider that accepts the connection and then says nothing used to hang the
+# whole parliament: the parent waits on every future, so one stalled seat meant
+# an orchestrator that never terminates. Both ceilings below are real deadlines
+# and both are overridable; 0 restores the old unbounded behaviour deliberately.
+DEFAULT_SEAT_TIMEOUT_S = 600       # per socket read, so a silent stream dies too
+DEFAULT_DISPATCH_TIMEOUT_S = 1800  # whole parallel round, wall clock
+MAX_TOOL_ITERS = 12                # tool-call rounds before a seat must answer
 
 
 @dataclass
@@ -28,6 +39,7 @@ class SeatSpec:
     phase: str = ""
     query_angle: str = ""
     ultrathink: bool = False
+    toolbox: Toolbox | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SeatSpec":
@@ -45,6 +57,7 @@ class SeatSpec:
             phase=str(raw.get("phase") or "").strip(),
             query_angle=str(raw.get("query_angle") or "").strip(),
             ultrathink=bool(raw.get("ultrathink") or raw.get("extended_thinking")),
+            toolbox=Toolbox.from_dict(raw.get("tools") or raw.get("toolbox")),
         )
 
 
@@ -161,6 +174,104 @@ def _anthropic_nonstream_text(body: dict[str, Any]) -> str:
     return "".join(str(b.get("text") or "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
 
 
+def _http_json(url: str, headers: dict[str, str], payload: dict[str, Any],
+               timeout: float | None) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _env_timeout(name: str, default: int) -> float | None:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        val = float(raw) if raw else float(default)
+    except ValueError:
+        val = float(default)
+    return None if val <= 0 else val
+
+
+def seat_timeout() -> float | None:
+    return _env_timeout("SELF_ORCH_SEAT_TIMEOUT_S", DEFAULT_SEAT_TIMEOUT_S)
+
+
+def dispatch_timeout() -> float | None:
+    return _env_timeout("SELF_ORCH_DISPATCH_TIMEOUT_S", DEFAULT_DISPATCH_TIMEOUT_S)
+
+
+def _tool_loop_openai(spec: SeatSpec, provider: Any, messages: list[dict],
+                      headers: dict[str, str], timeout: float | None,
+                      on_token: Callable[[str, str], None] | None) -> str:
+    """Let the seat actually use its tools, then answer.
+
+    Bounded by MAX_TOOL_ITERS. When the budget runs out the final request is
+    made with no tools attached, which forces the model to produce prose from
+    what it already learned instead of looping on tool calls forever.
+    """
+    box = spec.toolbox
+    convo = list(messages)
+    text = ""
+    for i in range(MAX_TOOL_ITERS + 1):
+        last = i == MAX_TOOL_ITERS
+        payload: dict[str, Any] = {"model": spec.model, "messages": convo, "stream": False}
+        if not last:
+            payload["tools"] = box.openai_tools()
+            payload["tool_choice"] = "auto"
+        body = _http_json(chat_url(provider), headers, payload, timeout)
+        msg = ((body.get("choices") or [{}])[0].get("message")) or {}
+        text = str(msg.get("content") or "")
+        calls = msg.get("tool_calls") or []
+        if text and on_token:
+            on_token(spec.role, text)
+        if last or not calls:
+            return text
+        convo.append({"role": "assistant", "content": text or None, "tool_calls": calls})
+        for c in calls:
+            fn = c.get("function") or {}
+            out = box.call(str(fn.get("name") or ""), parse_tool_args(fn.get("arguments")))
+            convo.append({"role": "tool", "tool_call_id": c.get("id"), "content": out})
+            if on_token:
+                on_token(spec.role, "[tool %s] %s" % (fn.get("name"), out[-200:]))
+    return text
+
+
+def _tool_loop_anthropic(spec: SeatSpec, provider: Any, system_text: str,
+                         turns: list[dict], headers: dict[str, str],
+                         timeout: float | None,
+                         on_token: Callable[[str, str], None] | None) -> str:
+    box = spec.toolbox
+    convo = list(turns)
+    text = ""
+    for i in range(MAX_TOOL_ITERS + 1):
+        last = i == MAX_TOOL_ITERS
+        payload: dict[str, Any] = {
+            "model": spec.model, "system": system_text, "messages": convo,
+            "max_tokens": ANTHROPIC_MAX_TOKENS, "stream": False,
+        }
+        if not last:
+            payload["tools"] = box.anthropic_tools()
+        body = _http_json(chat_url(provider), headers, payload, timeout)
+        blocks = body.get("content") or []
+        text = "".join(
+            str(b.get("text") or "") for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        uses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if text and on_token:
+            on_token(spec.role, text)
+        if last or not uses:
+            return text
+        convo.append({"role": "assistant", "content": blocks})
+        results = []
+        for u in uses:
+            out = box.call(str(u.get("name") or ""), parse_tool_args(u.get("input")))
+            results.append({"type": "tool_result", "tool_use_id": u.get("id"), "content": out})
+            if on_token:
+                on_token(spec.role, "[tool %s] %s" % (u.get("name"), out[-200:]))
+        convo.append({"role": "user", "content": results})
+    return text
+
+
 def call_seat(
     spec: SeatSpec,
     user_msg: str,
@@ -172,6 +283,8 @@ def call_seat(
     brief = spec.brief
     if spec.query_angle:
         brief = f"ANGLE: {spec.query_angle}\n\n{brief}"
+    if spec.toolbox:
+        brief = brief + spec.toolbox.preamble()
     try:
         provider = resolve_provider(spec.model)
     except ProviderError as e:
@@ -179,53 +292,64 @@ def call_seat(
 
     messages = build_messages(spec.role, brief, user_msg, history)
     is_anthropic = provider.chat_shape == "anthropic"
+    timeout = seat_timeout()
+    # A tool-using seat runs non-streamed: the loop needs whole structured
+    # responses (tool_calls / tool_use blocks), not token deltas.
+    tool_mode = spec.toolbox is not None
+    if tool_mode:
+        stream = False
 
-    if is_anthropic:
-        system_text, turns = _split_system(messages)
-        payload: dict[str, Any] = {
-            "model": spec.model,
-            "system": system_text,
-            "messages": turns,
-            "max_tokens": ANTHROPIC_MAX_TOKENS,
-            "stream": stream,
-        }
-    else:
-        payload = {
-            "model": spec.model,
-            "messages": messages,
-            "stream": stream,
-        }
-
-    data = json.dumps(payload).encode("utf-8")
     headers = auth_headers(provider)
     headers["Content-Type"] = "application/json"
     headers["Accept"] = "text/event-stream" if stream else "application/json"
-    req = urllib.request.Request(chat_url(provider), data=data, method="POST", headers=headers)
 
     content = ""
     try:
-        # No wall-clock timeout: stalls belong to the operator/infra, not this rail.
-        with urllib.request.urlopen(req, timeout=None) as resp:
-            if stream:
-                for raw in resp:
-                    parsed = _parse_sse_line(raw.decode("utf-8", "replace"))
-                    if not parsed:
-                        continue
-                    if is_anthropic:
-                        tok, done = _anthropic_delta_text(parsed)
-                        if done:
-                            break
-                    else:
-                        if parsed.get("done"):
-                            break
-                        tok, _reason = _delta_text(parsed)
-                    if tok:
-                        content += tok
-                        if on_token:
-                            on_token(spec.role, content)
+        if tool_mode and is_anthropic:
+            system_text, turns = _split_system(messages)
+            content = _tool_loop_anthropic(spec, provider, system_text, turns,
+                                           headers, timeout, on_token)
+        elif tool_mode:
+            content = _tool_loop_openai(spec, provider, messages, headers, timeout, on_token)
+        else:
+            if is_anthropic:
+                system_text, turns = _split_system(messages)
+                payload: dict[str, Any] = {
+                    "model": spec.model,
+                    "system": system_text,
+                    "messages": turns,
+                    "max_tokens": ANTHROPIC_MAX_TOKENS,
+                    "stream": stream,
+                }
             else:
-                body = json.loads(resp.read().decode("utf-8", "replace"))
-                content = _anthropic_nonstream_text(body) if is_anthropic else _nonstream_text(body)
+                payload = {"model": spec.model, "messages": messages, "stream": stream}
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(chat_url(provider), data=data, method="POST",
+                                         headers=headers)
+            # The timeout is per socket operation, so it also kills a stream that
+            # opened and then went silent -- the case that used to hang forever.
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if stream:
+                    for raw in resp:
+                        parsed = _parse_sse_line(raw.decode("utf-8", "replace"))
+                        if not parsed:
+                            continue
+                        if is_anthropic:
+                            tok, done = _anthropic_delta_text(parsed)
+                            if done:
+                                break
+                        else:
+                            if parsed.get("done"):
+                                break
+                            tok, _reason = _delta_text(parsed)
+                        if tok:
+                            content += tok
+                            if on_token:
+                                on_token(spec.role, content)
+                else:
+                    body = json.loads(resp.read().decode("utf-8", "replace"))
+                    content = (_anthropic_nonstream_text(body) if is_anthropic
+                               else _nonstream_text(body))
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8", "replace")[:500]
         return _error_seat(spec, f"HTTP {e.code}: {err}", time.time() - t0)
@@ -235,7 +359,7 @@ def call_seat(
     elapsed = time.time() - t0
     text = content.strip()
     status = "ok" if text else "empty"
-    return {
+    out = {
         "role": spec.role,
         "model": spec.model,
         "phase": spec.phase,
@@ -244,6 +368,9 @@ def call_seat(
         "elapsed_s": round(elapsed, 3),
         "error": None if text else "empty final content (reasoning-only or blank)",
     }
+    if spec.toolbox:
+        out["tools"] = spec.toolbox.audit()
+    return out
 
 
 def _error_seat(spec: SeatSpec, error: str, elapsed: float) -> dict[str, Any]:
@@ -340,14 +467,34 @@ def dispatch(
         return result
 
     results: list[dict[str, Any] | None] = [None] * len(specs)
-    with ThreadPoolExecutor(max_workers=len(specs), thread_name_prefix="seat") as pool:
+    deadline = dispatch_timeout()
+    pool = ThreadPoolExecutor(max_workers=len(specs), thread_name_prefix="seat")
+    try:
         futs = {pool.submit(run, spec): idx for idx, spec in enumerate(specs)}
-        for fut in as_completed(futs):
-            idx = futs[fut]
-            try:
-                results[idx] = fut.result()
-            except Exception as e:
-                results[idx] = _error_seat(specs[idx], f"{type(e).__name__}: {e}", 0.0)
+        try:
+            for fut in as_completed(futs, timeout=deadline):
+                idx = futs[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception as e:
+                    results[idx] = _error_seat(specs[idx], f"{type(e).__name__}: {e}", 0.0)
+        except FuturesTimeout:
+            # The round outlived its deadline. Every seat that did finish keeps
+            # its result; the stalled ones are reported as stalled. Returning a
+            # partial group is worth far more to the governor than a process
+            # that never comes back.
+            for fut, idx in futs.items():
+                if results[idx] is None:
+                    fut.cancel()
+                    results[idx] = _error_seat(
+                        specs[idx],
+                        f"seat did not finish within the {deadline:.0f}s dispatch deadline "
+                        f"(SELF_ORCH_DISPATCH_TIMEOUT_S); reported as stalled, not waited on",
+                        time.time() - t0,
+                    )
+                    anomalies.append(f"stalled seat: {specs[idx].role} on {specs[idx].model}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     seats_out = [r or _error_seat(specs[i], "missing result", 0.0) for i, r in enumerate(results)]
     statuses = [s["status"] for s in seats_out]

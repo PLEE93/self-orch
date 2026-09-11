@@ -76,6 +76,11 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     if not user_msg:
         print("need --user-msg or spec.user_msg", file=sys.stderr)
         return 2
+    if getattr(args, "workspace", None):
+        box = {"workspace": args.workspace, "allow_write": True,
+               "allow_shell": not args.no_shell, "allow_net": args.allow_net}
+        for seat in seats:
+            seat.setdefault("tools", box)
     specs = [SeatSpec.from_dict(s) for s in seats]
     dash_state = [
         {"role": s.role, "model": s.model, "ui_status": "pending", "preview": "", "elapsed_s": None}
@@ -122,6 +127,8 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         if args.quiet:
             return
         extra = (" verdict=" + run.verdict) if run.verdict else ""
+        if run.tool_calls:
+            extra += " tools=%d(%s)" % (run.tool_calls, ",".join(run.tools_used))
         print(
             "[stage] %-9s tier=%-5s model=%-22s seats=%d loop=%d %.1fs%s"
             % (run.stage, run.tier, run.model, run.seats, run.loop, run.elapsed_s, extra),
@@ -135,6 +142,10 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
             execute_seats=args.execute,
             max_loops=args.max_loops,
             level=args.level,
+            execute_slices=(args.execute_slice or None),
+            workspace=args.workspace,
+            allow_shell=not args.no_shell,
+            allow_net=args.allow_net,
             on_stage=on_stage,
         )
     except PipelineRefusal as e:
@@ -215,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help='seat as role=...;model=...;brief=...  (repeatable, use ; separators)',
     )
+    d.add_argument("--workspace",
+                   help="give every seat real tools scoped to this directory")
+    d.add_argument("--no-shell", action="store_true")
+    d.add_argument("--allow-net", action="store_true")
     d.add_argument("--out", help="also write JSON to this path")
     d.add_argument("--quiet", action="store_true", help="no stderr dashboard")
     d.set_defaults(func=cmd_dispatch)
@@ -230,6 +245,19 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--max-loops", type=int, default=2,
                     help="how many times execute may be re-run after a red-team FAIL")
     pl.add_argument("--level", default="standard", choices=["low", "med", "standard", "high"])
+    pl.add_argument(
+        "--execute-slice", action="append", default=[],
+        help="one distinct job per execution seat; repeat the flag. Without it the "
+             "pipeline supplies distinct defaults -- identical slices are refused.")
+    pl.add_argument(
+        "--workspace",
+        help="give the acting stages REAL tools scoped to this directory: gather and "
+             "red team may read, search and run checks; execute may also write. "
+             "Without it every seat is text-only and can describe work but not do it.")
+    pl.add_argument("--no-shell", action="store_true",
+                    help="workspace tools without command execution (read/write/search only)")
+    pl.add_argument("--allow-net", action="store_true",
+                    help="also expose http_get to workspace seats")
     pl.add_argument("--out", help="also write the result JSON to this path")
     pl.add_argument("--quiet", action="store_true", help="no stderr stage log")
     pl.set_defaults(func=cmd_pipeline)

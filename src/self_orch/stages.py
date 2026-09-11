@@ -32,8 +32,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .context_budget import compose_within
 from .providers import model_family
-from .rail import SeatSpec, dispatch
+from .rail import MAX_USER_MSG_CHARS, SeatSpec, dispatch
+from .seat_tools import Toolbox
 from .stage_prompts import STAGE_BRIEFS
 from .tiers import resolve_tier
 
@@ -59,7 +61,34 @@ STAGE_TIERS = {
     "deliver": "tier2",
 }
 
+# Which stages get real tools when a workspace is configured, and how much
+# power each one gets. The shape is deliberate: builders may write, the red team
+# may look and run checks but must not touch the evidence it is judging, and the
+# reasoning stages stay text-only so their cost goes into thinking.
+#   (allow_write, allow_shell)
+STAGE_TOOL_POWERS = {
+    "gather":  (False, True),
+    "execute": (True, True),
+    "redteam": (False, True),
+}
+
+# Two execution seats with the same brief and the same model are an ensemble,
+# not a decomposition -- they do the same job twice and the pipeline pretends it
+# parallelised. When the caller supplies no slices these do, and they are
+# distinct by construction.
+DEFAULT_EXECUTE_SLICES = (
+    "the primary change itself: the smallest edit that makes the intended behaviour real",
+    "the seams: every caller, callee, interface and config the primary change touches, "
+    "including the failure paths",
+    "the checks: the tests or verification steps that would fail if the primary change "
+    "were wrong, run them and report real output",
+    "the edges: empty, missing, malformed, concurrent, and rollback behaviour",
+)
+
 PARALLEL_STAGES = frozenset({"gather", "execute"})
+# Every stage is mandatory. A run that reaches deliver without gathering or
+# organizing is not a cheaper run of this pipeline, it is a different one.
+MANDATORY_STAGES = frozenset(STAGE_ORDER)
 ADVERSARIAL_STAGES = frozenset({"review", "redteam"})
 
 
@@ -80,6 +109,8 @@ class StageRun:
     verdict: str = ""
     outputs: list[str] = field(default_factory=list)
     anomalies: list[str] = field(default_factory=list)
+    tool_calls: int = 0
+    tools_used: list[str] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -91,6 +122,7 @@ class StageRun:
             "seats": self.seats, "loop": self.loop,
             "elapsed_s": round(self.elapsed_s, 3), "status": self.status,
             "verdict": self.verdict, "anomalies": self.anomalies,
+            "tool_calls": self.tool_calls, "tools_used": self.tools_used,
             "output_chars": len(self.text),
         }
 
@@ -120,6 +152,7 @@ class PipelineResult:
             "loops": self.loops,
             "elapsed_s": round(self.elapsed_s, 3),
             "stages_run": [r.stage for r in self.ledger],
+            "tool_calls": sum(r.tool_calls for r in self.ledger),
             "ledger": [r.to_dict() for r in self.ledger],
             "answer": self.answer,
         }
@@ -132,6 +165,13 @@ class PipelineResult:
 # loop and bill the user for it. Caught by test_parse_verdict.
 _VERDICT_RE = re.compile(r"^\s*VERDICT\s*:\s*([A-Za-z-]+)", re.MULTILINE | re.IGNORECASE)
 _ATTACK_RE = re.compile(r"ATTACKS\s+RUN", re.IGNORECASE)
+# A heading is not evidence. "ATTACKS RUN\nnone" matched the old check and
+# passed, which made the no-empty-seats promise unenforced in exactly the case
+# it existed for. These are the words that mean "I did not attack anything".
+_NO_ATTACK_WORDS = frozenset({
+    "none", "n/a", "na", "nil", "nothing", "no attacks", "not applicable",
+    "-", "--", "(none)", "[none]", "none.", "n/a.",
+})
 
 
 def parse_verdict(text: str) -> str:
@@ -144,17 +184,45 @@ def parse_verdict(text: str) -> str:
     return m.group(1).strip().upper() if m else ""
 
 
+def named_attacks(text: str) -> list[str]:
+    """The attacks the red team says it actually ran.
+
+    Reads the lines under the ATTACKS RUN heading, stops at the next heading,
+    and drops bullet punctuation and the words that mean "I ran none". What is
+    left is the evidence; an empty list means the seat claimed a verdict it did
+    not earn.
+    """
+    body = text or ""
+    m = _ATTACK_RE.search(body)
+    if not m:
+        return []
+    attacks: list[str] = []
+    for raw in body[m.end():].splitlines():
+        line = raw.strip().lstrip("-*•–—").strip()
+        if not line:
+            continue
+        # A following ALL-CAPS heading (VERDICT:, FINDINGS, RESIDUAL RISK) ends
+        # the list -- otherwise the rest of the report reads as attacks.
+        if re.match(r"^[A-Z][A-Z \t/&-]{3,}:?\s*$", line) or re.match(r"^VERDICT\s*:", line, re.I):
+            break
+        if line.lower().rstrip(".:") in _NO_ATTACK_WORDS:
+            continue
+        if len(line) < 8:          # "ok", "1.", "yes" are not attacks
+            continue
+        attacks.append(line)
+    return attacks
+
+
 def evaluate_redteam(text: str) -> tuple[bool, str]:
     """(passed, reason). The red-team gate, failing closed on every ambiguity.
 
-    Three ways to not pass, and only one way to pass:
+    Four ways to not pass, and only one way to pass:
       - no parseable verdict            -> FAIL (a gate that cannot read its own
                                            result must never report success)
       - verdict FAIL                    -> FAIL (the ordinary case)
-      - PASS with no attacks named      -> FAIL (an empty seat; the brief says a
-                                           verdict without named falsification
-                                           attempts is discarded, and this is
-                                           where that promise is kept)
+      - PASS with no ATTACKS RUN block  -> FAIL (an empty seat)
+      - PASS with the block present but
+        nothing named under it          -> FAIL (the same empty seat, dressed)
     """
     body = text or ""
     verdict = parse_verdict(body)
@@ -164,7 +232,36 @@ def evaluate_redteam(text: str) -> tuple[bool, str]:
         return False, f"red team verdict {verdict}"
     if not _ATTACK_RE.search(body):
         return False, "red team returned PASS without naming any attacks (empty seat, discarded)"
-    return True, "red team PASS with named attacks"
+    attacks = named_attacks(body)
+    if not attacks:
+        return False, ("red team returned PASS with an ATTACKS RUN heading but nothing "
+                       "named under it (empty seat, discarded)")
+    return True, f"red team PASS with {len(attacks)} named attack(s)"
+
+
+# The verdicts a pre-execution reviewer may use to let the work proceed. Anything
+# else -- REJECT, FAIL, a malformed line, or no line at all -- stops the run.
+REVIEW_PASS_VERDICTS = frozenset({
+    "APPROVE", "APPROVED", "APPROVE-WITH-CHANGES", "PASS", "ACCEPT",
+})
+
+
+def evaluate_review(text: str) -> tuple[bool, str]:
+    """(passed, reason) for the pre-execution review, failing closed.
+
+    The old gate only stopped on the exact word REJECT, so an UNDECLARED
+    verdict, a malformed line, a truncated answer or a plain FAIL all sailed
+    into execution -- the gate read as protection while approving anything that
+    was not one specific string. A review that cannot be read is not an
+    approval.
+    """
+    verdict = parse_verdict(text or "")
+    if not verdict:
+        return False, ("pre-execution review returned no parseable VERDICT line; failing "
+                       "closed rather than executing an unreviewed plan")
+    if verdict not in REVIEW_PASS_VERDICTS:
+        return False, f"pre-execution review verdict {verdict}"
+    return True, f"pre-execution review {verdict}"
 
 
 # ── enforcement ──────────────────────────────────────────────────────────────
@@ -198,18 +295,52 @@ def assert_stage_order(stages_run: list[str]) -> None:
                 f"may repeat (loop-back). Ledger: {seen}"
             )
         pos = max(pos, idx)
+    missing = [name for name in STAGE_ORDER if name in MANDATORY_STAGES and name not in seen]
+    if missing:
+        raise PipelineRefusal(
+            f"ledger is missing mandatory stage(s) {missing}; ordering alone is not the "
+            f"contract -- a run that skipped them is not a run of this pipeline. "
+            f"Ledger: {seen}"
+        )
+
+
+def default_execute_slices(seats: int) -> list[str]:
+    """Distinct default slices for `seats` execution seats."""
+    out = list(DEFAULT_EXECUTE_SLICES[:max(0, seats)])
+    while len(out) < seats:
+        out.append(f"remaining work, part {len(out) + 1}: whatever the slices above do not "
+                   f"cover; state explicitly what you took and what you left")
+    return out
+
+
+def assert_distinct_slices(slices: list[str], seats: int) -> None:
+    """Refuse parallel execution seats that were never given different jobs."""
+    if seats <= 1:
+        return
+    real = [s.strip() for s in (slices or []) if s and s.strip()]
+    if len(set(real)) < seats:
+        raise PipelineRefusal(
+            f"{seats} execution seats were given {len(set(real))} distinct slice(s). "
+            f"Seats with the same brief and the same model are an ensemble, not a "
+            f"decomposition -- pass one --execute-slice per seat, or let the pipeline "
+            f"supply its defaults."
+        )
 
 
 # ── the pipeline ─────────────────────────────────────────────────────────────
 
-def _compose(sections: list[tuple[str, str]]) -> str:
-    out = []
-    for title, body in sections:
-        body = (body or "").strip()
-        if not body:
-            continue
-        out.append("===== %s =====\n%s" % (title.upper(), body))
-    return "\n\n".join(out)
+def _compose(sections: list[tuple[str, str]] | list[tuple[str, str, int]],
+             limit: int = MAX_USER_MSG_CHARS) -> str:
+    """Compose stage context, guaranteed to fit the rail's input ceiling.
+
+    This used to be a plain join. The pipeline feeds each stage the stages
+    before it, so organize receives three gather outputs at once and deliver
+    receives most of the run; past a few substantive stages the join exceeded
+    the rail's hard ceiling and the whole pipeline died with a ValueError after
+    paying for every stage before the failure. Sections are now shrunk by
+    declared priority, head and tail kept, with the drop stated in the text.
+    """
+    return compose_within(list(sections), limit)
 
 
 def run_pipeline(
@@ -221,6 +352,9 @@ def run_pipeline(
     execute_slices: list[str] | None = None,
     tier_overrides: dict[str, str] | None = None,
     level: str = "standard",
+    workspace: str | None = None,
+    allow_shell: bool = True,
+    allow_net: bool = False,
     dispatch_fn: Callable[..., Any] = dispatch,
     on_stage: Callable[[StageRun], None] | None = None,
 ) -> PipelineResult:
@@ -229,6 +363,19 @@ def run_pipeline(
     tiers = dict(STAGE_TIERS)
     tiers.update(tier_overrides or {})
     ledger: list[StageRun] = []
+
+    # With a workspace the acting stages get real tools; without one they stay
+    # text-only and the pipeline says so rather than pretending execute executed.
+    base_box = Toolbox.from_dict(
+        {"workspace": workspace, "allow_write": True,
+         "allow_shell": allow_shell, "allow_net": allow_net}
+    ) if workspace else None
+
+    def toolbox_for(stage: str) -> Toolbox | None:
+        if not base_box or stage not in STAGE_TOOL_POWERS:
+            return None
+        write, shell = STAGE_TOOL_POWERS[stage]
+        return base_box.derive(allow_write=write, allow_shell=shell)
 
     def model_for(stage: str) -> tuple[str, str]:
         tier = tiers[stage]
@@ -245,15 +392,20 @@ def run_pipeline(
             specs.append(SeatSpec(
                 role=role, model=model, phase=stage, query_angle=angle,
                 brief=brief + (f"\n\nYOUR ANGLE: {angle}\n" if angle else ""),
+                toolbox=toolbox_for(stage),
             ))
         r = dispatch_fn(specs, user_msg=context, level=level)
         data = r.to_dict() if hasattr(r, "to_dict") else r
-        outs = [s.get("output", "") for s in data.get("substrates", [])]
+        subs = data.get("substrates", []) or []
+        outs = [s.get("output", "") for s in subs]
+        audits = [s.get("tools") or {} for s in subs]
         run = StageRun(
             stage=stage, tier=tier, model=model, seats=seats, loop=loop,
             elapsed_s=data.get("elapsed_s", 0.0),
             status="ok" if data.get("dispatch_state") == "completed" else "degraded",
             outputs=outs, anomalies=list(data.get("anomalies") or []),
+            tool_calls=sum(int(a.get("tool_calls") or 0) for a in audits),
+            tools_used=sorted({t for a in audits for t in (a.get("tools_used") or [])}),
         )
         ledger.append(run)
         if on_stage:
@@ -276,8 +428,14 @@ def run_pipeline(
     assert_family_split(resolve_tier(tiers["redteam"]), resolve_tier(tiers["execute"]),
                         "red team stage")
 
+    execute_seats = max(1, execute_seats)
+    slices = list(execute_slices) if execute_slices else default_execute_slices(execute_seats)
+    assert_distinct_slices(slices, execute_seats)
+
     # 1. orient
-    orient = run_stage("orient", user_msg)
+    # Composed, not raw: a long request must be budgeted on stage one too,
+    # or the pipeline dies at the ceiling before it has composed anything.
+    orient = run_stage("orient", _compose([("original request", user_msg, 5)]))
 
     # 2. gather (parallel)
     angles = gather_angles or [
@@ -285,51 +443,51 @@ def run_pipeline(
         "prior art, existing solutions, and what has already been tried",
         "constraints, risks, and the ways this is known to go wrong",
     ][:gather_seats]
-    gather_ctx = _compose([("original request", user_msg),
-                           ("working brief", orient.text)])
+    gather_ctx = _compose([("original request", user_msg, 5),
+                           ("working brief", orient.text, 4)])
     gather = run_stage("gather", gather_ctx, seats=max(1, gather_seats), angles=angles)
 
     # 3. organize
     organize = run_stage("organize", _compose([
-        ("original request", user_msg),
-        ("working brief", orient.text),
+        ("original request", user_msg, 5),
+        ("working brief", orient.text, 4),
         ("raw findings from the gathering seats", gather.text),
     ]))
 
     # 4. heavy
     heavy = run_stage("heavy", _compose([
-        ("original request", user_msg),
-        ("working brief", orient.text),
+        ("original request", user_msg, 5),
+        ("working brief", orient.text, 4),
         ("organized context", organize.text),
     ]))
 
     # 5. review -- gets the BRIEF as well as the plan, deliberately
     review = run_stage("review", _compose([
-        ("original request", user_msg),
-        ("working brief", orient.text),
-        ("the plan under review", heavy.text),
+        ("original request", user_msg, 5),
+        ("working brief", orient.text, 4),
+        ("the plan under review", heavy.text, 3),
     ]))
     review.verdict = parse_verdict(review.text) or "UNDECLARED"
-    if review.verdict == "REJECT":
-        return finish("failed", "pre-execution review REJECTED the plan; "
-                                "nothing was executed")
+    review_ok, review_reason = evaluate_review(review.text)
+    if not review_ok:
+        return finish("failed", f"{review_reason}; nothing was executed")
 
     # 6/7. execute -> redteam, looping on FAIL
     required_changes = ""
     while True:
         execute = run_stage("execute", _compose([
-            ("original request", user_msg),
-            ("working brief", orient.text),
-            ("approved plan", heavy.text),
+            ("original request", user_msg, 5),
+            ("working brief", orient.text, 4),
+            ("approved plan", heavy.text, 3),
             ("review findings to honour", review.text),
             ("required changes from the previous red-team pass", required_changes),
-        ]), seats=max(1, execute_seats), angles=execute_slices, loop=loops_done)
+        ]), seats=execute_seats, angles=slices, loop=loops_done)
 
         redteam = run_stage("redteam", _compose([
-            ("original request", user_msg),
-            ("working brief and its test criteria", orient.text),
+            ("original request", user_msg, 5),
+            ("working brief and its test criteria", orient.text, 4),
             ("the plan", heavy.text),
-            ("what execution produced", execute.text),
+            ("what execution produced", execute.text, 3),
         ]), loop=loops_done)
 
         passed, reason = evaluate_redteam(redteam.text)
@@ -344,11 +502,11 @@ def run_pipeline(
 
     # 8. deliver
     deliver = run_stage("deliver", _compose([
-        ("original request", user_msg),
-        ("working brief and its test criteria", orient.text),
+        ("original request", user_msg, 5),
+        ("working brief and its test criteria", orient.text, 4),
         ("organized context", organize.text),
         ("the plan", heavy.text),
-        ("what was built", execute.text),
+        ("what was built", execute.text, 3),
         ("red team verdict and attacks", redteam.text),
     ]))
 

@@ -58,7 +58,14 @@ Four things there are enforced in code, not asked for in a prompt:
 - **A real verdict.** The red team's output is parsed. No readable verdict is a
   FAIL, never a pass — the gate fails closed.
 - **No empty seats.** A red team that returns PASS without naming the attacks it
-  ran is discarded and treated as FAIL. Agreement is not verification.
+  ran is discarded and treated as FAIL -- and the check reads what is written
+  under `ATTACKS RUN`, not merely that the heading exists, so `ATTACKS RUN /
+  none` is an empty seat too. Agreement is not verification.
+- **Review fails closed.** The pre-execution review must declare an approval to
+  let the run proceed. A missing, malformed or failing verdict stops it; an
+  unreadable review is not an approval.
+- **Presence, not just order.** `assert_stage_order` refuses a ledger that is
+  missing any mandatory stage, not only one that ran them out of order.
 
 On FAIL the pipeline loops back to execute carrying the red team's required
 changes, bounded by `--max-loops`, then stops and says why.
@@ -110,6 +117,57 @@ Which stage runs on which tier: `orient`/`organize`/`deliver` on tier2,
 `gather`/`execute` on tier1, `review`/`redteam` on tier3, `heavy` on tier4.
 Defaults are starting points, not a claim about which model is best — check your
 provider's current model list before shipping.
+
+
+### Seats with real tools
+
+Without a workspace every seat is a text-only model call: it can reason about
+work and describe it, but it cannot open a file, run a test, or check a claim.
+That makes two of the pipeline's own instructions impossible to follow --
+execute is told to implement and verify, and the red team is told to check the
+artifact rather than the claim.
+
+Give the run a workspace and the acting stages get real tools:
+
+```bash
+self-orch pipeline --user-msg "fix the failing test in calc.py" --workspace ./myrepo
+```
+
+| Stage | read / search | run commands | write files |
+|---|---|---|---|
+| `gather` | yes | yes | no |
+| `execute` | yes | yes | **yes** |
+| `redteam` | yes | yes | no -- it must not edit the evidence it judges |
+| orient / organize / heavy / review / deliver | no | no | no |
+
+Tools are `read_file`, `list_dir`, `search_files`, `write_file`, `run`, and
+`http_get` (only with `--allow-net`). Every path is resolved **after symlinks**
+and refused if it leaves the workspace, every result is clipped so one large
+file cannot blow the next stage's context, and every call is recorded: the
+result JSON carries `tool_calls` per stage and the audit trail per seat. Use
+`--no-shell` for a workspace the seats may read and write but not execute in.
+
+### Nothing waits forever
+
+A provider that accepts the connection and then goes quiet used to hang the
+whole run, because the parent waited on every seat. Two deadlines now bound it,
+both overridable, and `0` restores unbounded waiting deliberately:
+
+| Variable | Default | What it bounds |
+|---|---|---|
+| `SELF_ORCH_SEAT_TIMEOUT_S` | `600` | each socket read, so a silent stream dies too |
+| `SELF_ORCH_DISPATCH_TIMEOUT_S` | `1800` | the whole parallel round |
+
+A round that outlives its deadline returns **partial**: every seat that finished
+keeps its output, the stalled ones are reported as stalled with an anomaly, and
+the governor gets an answer instead of a process that never returns.
+
+### Real decomposition, not an ensemble
+
+`--execute` seats each get a **different** slice of the work. Pass your own with
+repeated `--execute-slice`, or let the pipeline supply its defaults (primary
+change / seams / checks / edges). Two seats with the same brief and the same
+model are an ensemble doing one job twice, so identical slices are refused.
 
 ## Doctrine
 
