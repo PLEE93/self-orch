@@ -51,6 +51,33 @@ Stdout is the result. Read `dispatch_state`: `completed | partial | failed | abo
 
 Print `self-orch doctrine` if you need the full governor loop injected.
 
+## Two ways to run this
+
+**`self-orch dispatch`** is the primitive: N seats in parallel, once, returning
+one group. You are the governor and you decide what happens next.
+
+**`self-orch pipeline`** is the full process, and it enforces its own order:
+
+    orient -> gather -> organize -> heavy -> review -> execute -> redteam
+           -> deliver, or back to execute
+
+Four things are enforced in code rather than asked for in a prompt:
+
+- Stages run in that order. The result carries a ledger of what actually ran.
+- The reviewer may not share a model family with the planner it reviews, and the
+  red team may not share one with the seats that built the work. If the
+  configured tiers make that impossible the pipeline refuses before spending
+  anything.
+- The red team's verdict is parsed. No readable verdict is a FAIL, never a pass.
+- A red team that returns PASS without naming the attacks it ran is discarded
+  and treated as FAIL. Agreement is not verification.
+
+On FAIL the pipeline returns to execute carrying the red team's required
+changes, up to `--max-loops` times, then stops and says why.
+
+Use `pipeline` when the task deserves a process. Use `dispatch` when you only
+need several seats at once and you are steering yourself.
+
 ## Model tiers
 
 A seat's `model` may be a literal model id (`glm-5.3`, `claude-sonnet-4-5`) or

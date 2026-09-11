@@ -13,6 +13,9 @@ from .doctrine import GOVERNOR_LOOP
 from .install import doctor as install_doctor
 from .install import main as install_main
 from .rail import SeatSpec, dispatch
+from .stages import (
+    STAGE_ORDER, STAGE_TIERS, PipelineRefusal, run_pipeline,
+)
 
 
 def _load_spec(path: Path) -> dict:
@@ -96,6 +99,58 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     return 0 if result.dispatch_state == "completed" else 1
 
 
+def cmd_stages(_args: argparse.Namespace) -> int:
+    """Print the enforced stage order and the tier each stage runs on."""
+    from .tiers import resolve_tier
+    rows = []
+    for name in STAGE_ORDER:
+        tier = STAGE_TIERS[name]
+        rows.append({"stage": name, "tier": tier, "model": resolve_tier(tier)})
+    json.dump({"stage_order": list(STAGE_ORDER), "stages": rows}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_pipeline(args: argparse.Namespace) -> int:
+    """Run the full seven-stage process, not a single same-turn fanout."""
+    user_msg = args.user_msg or ""
+    if not user_msg:
+        print("need --user-msg", file=sys.stderr)
+        return 2
+
+    def on_stage(run) -> None:
+        if args.quiet:
+            return
+        extra = (" verdict=" + run.verdict) if run.verdict else ""
+        print(
+            "[stage] %-9s tier=%-5s model=%-22s seats=%d loop=%d %.1fs%s"
+            % (run.stage, run.tier, run.model, run.seats, run.loop, run.elapsed_s, extra),
+            file=sys.stderr,
+        )
+
+    try:
+        result = run_pipeline(
+            user_msg,
+            gather_seats=args.gather,
+            execute_seats=args.execute,
+            max_loops=args.max_loops,
+            level=args.level,
+            on_stage=on_stage,
+        )
+    except PipelineRefusal as e:
+        json.dump({"state": "refused", "reason": str(e)}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        print("pipeline refused: %s" % e, file=sys.stderr)
+        return 2
+
+    payload = result.to_dict()
+    if args.out:
+        Path(args.out).write_text(json.dumps(payload, indent=2) + "\n")
+    json.dump(payload, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0 if result.state == "completed" else 1
+
+
 def cmd_doctrine(_args: argparse.Namespace) -> int:
     sys.stdout.write(GOVERNOR_LOOP)
     if not GOVERNOR_LOOP.endswith("\n"):
@@ -163,6 +218,24 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--out", help="also write JSON to this path")
     d.add_argument("--quiet", action="store_true", help="no stderr dashboard")
     d.set_defaults(func=cmd_dispatch)
+
+    pl = sub.add_parser(
+        "pipeline",
+        help="run the full seven-stage process (orient->gather->organize->heavy"
+             "->review->execute->redteam->deliver, looping on red-team FAIL)",
+    )
+    pl.add_argument("--user-msg", default="", help="the task, in the user's own words")
+    pl.add_argument("--gather", type=int, default=3, help="parallel context-gathering seats")
+    pl.add_argument("--execute", type=int, default=2, help="parallel execution seats")
+    pl.add_argument("--max-loops", type=int, default=2,
+                    help="how many times execute may be re-run after a red-team FAIL")
+    pl.add_argument("--level", default="standard", choices=["low", "med", "standard", "high"])
+    pl.add_argument("--out", help="also write the result JSON to this path")
+    pl.add_argument("--quiet", action="store_true", help="no stderr stage log")
+    pl.set_defaults(func=cmd_pipeline)
+
+    st = sub.add_parser("stages", help="print the enforced stage order and each stage's tier")
+    st.set_defaults(func=cmd_stages)
 
     g = sub.add_parser("doctrine", help="print governor loop for injection into any agent")
     g.set_defaults(func=cmd_doctrine)
