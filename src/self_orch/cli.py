@@ -121,8 +121,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     json.dump(payload, sys.stdout, indent=2)
     sys.stdout.write("\n")
     keys = payload.get("keys") or {}
-    if not any(keys.values()):
-        print("No model API keys in the environment. Ask the human for ZAI_API_KEY and/or XAI_API_KEY.", file=sys.stderr)
+    creds = payload.get("credentials") or {}
+    # A user who authenticated their Claude Code / Codex / Grok CLI holds NO
+    # API key and is perfectly runnable -- that account-token path is the
+    # headline setup this rail supports. Judging on keys alone reported
+    # failure for exactly that user.
+    have_key = any(keys.values())
+    have_cred = any(v and v != "none" for v in creds.values())
+    if not have_key and not have_cred:
+        print(
+            "No usable model credential. Either set an API key (ZAI_API_KEY, "
+            "XAI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) or log in to a "
+            "coding agent CLI (Claude Code, Codex, Grok) and self-orch will "
+            "reuse that session.",
+            file=sys.stderr,
+        )
         return 1
     if not payload.get("cli"):
         print("self-orch not on PATH. Run: python3 scripts/install.py --agent auto", file=sys.stderr)

@@ -290,6 +290,14 @@ def install(
 
 
 def doctor(agent: str | None = None) -> dict:
+    # `doctor` is the one place that must report BOTH halves of "can this
+    # install actually run": which credential each vendor resolved (an API
+    # key OR an already-authenticated coding-agent session), and what each
+    # difficulty tier currently points at. Both were unreachable before:
+    # tier_table() and credential_status() existed and nothing called them.
+    from .auth import credential_status
+    from .tiers import tier_table
+
     agent = agent or detect_agent()
     cli = shutil.which("self-orch")
     version = None
@@ -314,6 +322,8 @@ def doctor(agent: str | None = None) -> dict:
         "cli": cli,
         "version": version,
         "keys": key_status(),
+        "credentials": credential_status(),
+        "tiers": tier_table(),
         "skills": files,
         "path_has_local_bin": str(Path.home() / ".local" / "bin") in os.environ.get("PATH", ""),
     }

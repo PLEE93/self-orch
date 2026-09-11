@@ -51,6 +51,23 @@ Stdout is the result. Read `dispatch_state`: `completed | partial | failed | abo
 
 Print `self-orch doctrine` if you need the full governor loop injected.
 
+## Model tiers
+
+A seat's `model` may be a literal model id (`glm-5.3`, `claude-sonnet-4-5`) or
+a difficulty tier: `tier1`, `tier2`, `tier3`, `tier4` (aliases: `t1`, `tier:1`,
+`tier 1`). A tier expands to whatever model the user configured for it, so the
+same spec runs on whatever models that user actually has.
+
+- `tier1` - mechanical worker seats: mass reads, extraction, wide parallel work.
+- `tier2` - seats needing real understanding: analysis, judgment, synthesis.
+- `tier3` - falsification / verification seats. Keep this a different model
+  family from the builders, so a verifier never grades its own family's work.
+- `tier4` - the single heaviest step in a mission: plan, architecture, diagnosis.
+
+Prefer tiers over literal ids when you do not know which models this user has.
+Run `self-orch doctor` to see the current tier table and which credential each
+vendor resolved.
+
 ## Rules
 
 - Zero chatter before the dispatch. The tool call is the first emit.
