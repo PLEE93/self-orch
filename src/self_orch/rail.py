@@ -10,13 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .doctrine import maybe_append_falsification, mission_block
-from .providers import ProviderError, chat_url, resolve_provider
+from .doctrine import is_verification_role, maybe_append_falsification, mission_block
+from .providers import ProviderError, auth_headers, chat_url, model_family, resolve_provider
 
 MAX_SEATS = 8
 MAX_BRIEF_CHARS = 8000
 MAX_USER_MSG_CHARS = 12000
 SCHEMA = "self_orch.substrate_group.v3"
+ANTHROPIC_MAX_TOKENS = 8192
 
 
 @dataclass
@@ -96,6 +97,20 @@ def build_messages(role: str, brief: str, user_msg: str, history: list[dict] | N
     return msgs
 
 
+def _split_system(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Anthropic's Messages API takes system prompt as a top-level field, not
+    a message with role=system, and only accepts user/assistant in `messages`."""
+    system_parts = [str(m.get("content") or "") for m in messages if m.get("role") == "system"]
+    rest = [
+        {"role": m["role"], "content": str(m.get("content") or "")}
+        for m in messages
+        if m.get("role") in ("user", "assistant")
+    ]
+    if not rest:
+        rest = [{"role": "user", "content": "Execute your substrate mission brief now and return your final answer."}]
+    return "\n\n".join(p for p in system_parts if p), rest
+
+
 def _parse_sse_line(line: str) -> dict[str, Any] | None:
     line = line.strip()
     if not line.startswith("data:"):
@@ -125,6 +140,27 @@ def _nonstream_text(body: dict[str, Any]) -> str:
     return str(msg.get("content") or "")
 
 
+def _anthropic_delta_text(chunk: dict[str, Any]) -> tuple[str, bool]:
+    """Return (text, done) from one Anthropic SSE `data:` payload.
+    Anthropic streams `content_block_delta` events with a `text_delta`
+    payload and signals completion with a `message_stop` event -- there is
+    no OpenAI-style [DONE] sentinel."""
+    kind = chunk.get("type")
+    if kind == "content_block_delta":
+        delta = chunk.get("delta") or {}
+        if delta.get("type") == "text_delta":
+            return str(delta.get("text") or ""), False
+        return "", False
+    if kind in ("message_stop", "error"):
+        return "", True
+    return "", False
+
+
+def _anthropic_nonstream_text(body: dict[str, Any]) -> str:
+    blocks = body.get("content") or []
+    return "".join(str(b.get("text") or "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+
+
 def call_seat(
     spec: SeatSpec,
     user_msg: str,
@@ -141,22 +177,31 @@ def call_seat(
     except ProviderError as e:
         return _error_seat(spec, str(e), time.time() - t0)
 
-    payload: dict[str, Any] = {
-        "model": spec.model,
-        "messages": build_messages(spec.role, brief, user_msg, history),
-        "stream": stream,
-    }
+    messages = build_messages(spec.role, brief, user_msg, history)
+    is_anthropic = provider.chat_shape == "anthropic"
+
+    if is_anthropic:
+        system_text, turns = _split_system(messages)
+        payload: dict[str, Any] = {
+            "model": spec.model,
+            "system": system_text,
+            "messages": turns,
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "stream": stream,
+        }
+    else:
+        payload = {
+            "model": spec.model,
+            "messages": messages,
+            "stream": stream,
+        }
+
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        chat_url(provider),
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {provider.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream" if stream else "application/json",
-        },
-    )
+    headers = auth_headers(provider)
+    headers["Content-Type"] = "application/json"
+    headers["Accept"] = "text/event-stream" if stream else "application/json"
+    req = urllib.request.Request(chat_url(provider), data=data, method="POST", headers=headers)
+
     content = ""
     try:
         # No wall-clock timeout: stalls belong to the operator/infra, not this rail.
@@ -166,16 +211,21 @@ def call_seat(
                     parsed = _parse_sse_line(raw.decode("utf-8", "replace"))
                     if not parsed:
                         continue
-                    if parsed.get("done"):
-                        break
-                    tok, _reason = _delta_text(parsed)
+                    if is_anthropic:
+                        tok, done = _anthropic_delta_text(parsed)
+                        if done:
+                            break
+                    else:
+                        if parsed.get("done"):
+                            break
+                        tok, _reason = _delta_text(parsed)
                     if tok:
                         content += tok
                         if on_token:
                             on_token(spec.role, content)
             else:
                 body = json.loads(resp.read().decode("utf-8", "replace"))
-                content = _nonstream_text(body)
+                content = _anthropic_nonstream_text(body) if is_anthropic else _nonstream_text(body)
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8", "replace")[:500]
         return _error_seat(spec, f"HTTP {e.code}: {err}", time.time() - t0)
@@ -208,6 +258,26 @@ def _error_seat(spec: SeatSpec, error: str, elapsed: float) -> dict[str, Any]:
     }
 
 
+def _model_diversity_anomalies(specs: list[SeatSpec]) -> list[str]:
+    """Falsification-mandate text is code-enforced on verification roles
+    (doctrine.maybe_append_falsification); model-family diversity between a
+    verifier and the builder(s) it is checking was not. This does not block
+    the dispatch (a single-key setup may only have one family available) --
+    it surfaces the gap as an anomaly so the governor sees it and can choose
+    a different tier next time."""
+    verifier_families = {model_family(s.model) for s in specs if is_verification_role(s.role)}
+    builder_families = {model_family(s.model) for s in specs if not is_verification_role(s.role)}
+    overlap = verifier_families & builder_families
+    if overlap and verifier_families and builder_families:
+        return [
+            "model-diversity: verification seat(s) share a model family (%s) with builder seat(s) "
+            "in this dispatch -- a verifier auditing its own family is a weaker check than routing "
+            "it to a different tier. Not blocked; consider SELF_ORCH_TIER3_MODEL for verification."
+            % ", ".join(sorted(overlap))
+        ]
+    return []
+
+
 def dispatch(
     seats: list[SeatSpec | dict[str, Any]],
     user_msg: str,
@@ -224,6 +294,8 @@ def dispatch(
     user_msg = (user_msg or "").strip()
     if len(user_msg) > MAX_USER_MSG_CHARS:
         raise ValueError(f"user_msg exceeds {MAX_USER_MSG_CHARS} chars")
+
+    anomalies = _model_diversity_anomalies(specs)
 
     live: list[dict[str, Any]] = [
         {
@@ -294,4 +366,5 @@ def dispatch(
         level=level,
         user_msg=user_msg,
         elapsed_s=time.time() - t0,
+        anomalies=anomalies,
     )
